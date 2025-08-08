@@ -1,0 +1,694 @@
+pipeline:
+  name: CI Pipeline
+  identifier: CI_Pipeline
+  orgIdentifier: ATD
+  projectIdentifier: Backstage
+  tags: {}
+  delegateSelectors:
+    - che-prod-tools-harness-atd-delegate
+  properties:
+    ci:
+      codebase:
+        connectorRef: org.QISD_GHE
+        repoName: backstage-qisd
+        build: <+input>
+  when:
+    condition: <+trigger.payload.pull_request.merged> == true
+  stages:
+    - parallel:
+        - stage:
+            name: Build
+            identifier: Build
+            description: ""
+            type: CI
+            failureStrategies:
+              - onFailure:
+                  errors:
+                    - AllErrors
+                  action:
+                    type: StageRollback
+            spec:
+              cloneCodebase: true
+              infrastructure:
+                type: KubernetesDirect
+                spec:
+                  connectorRef: account.acct_toolsprod_cluster_connector
+                  namespace: harness-delegate-ng
+                  serviceAccountName: harness-atd-delegate
+                  automountServiceAccountToken: true
+                  nodeSelector: {}
+                  harnessImageConnectorRef: account.acct_ecr_eid_connector_prod
+                  os: Linux
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Build application
+                      identifier: Build_application
+                      spec:
+                        connectorRef: org.QISD_Nexus_NonProd
+                        image: nexus-nonprod-gss.uscis.dhs.gov:8121/node:20.13.1
+                        shell: Sh
+                        command: |-
+                          echo "Build type: <+codebase.build.type>"
+                          if [ "<+codebase.build.type>" = "pullRequest" ]; then
+                            echo "Triggered by PR: <+trigger.prNumber> from <+trigger.prSourceBranch> to <+trigger.prTargetBranch>"
+                          else
+                            echo "Branch build: <+codebase.build.branch>"
+                          fi
+
+                          touch ${KAFKA_CLIENT_KEY_UPPER}
+                          touch ${KAFKA_CLIENT_KEY_LOWER}
+                          touch KAFKA_CLIENT_CERT_${KAFKA_ENV_UPPER_NAME}.crt
+                          touch KAFKA_CLIENT_CERT_${KAFKA_ENV_LOWER_NAME}.crt
+
+                          # corepack prepare yarn@1.18.0 --activate
+                          export NODE_EXTRA_CA_CERTS=$(pwd)/uscis-ca.crt
+                          yarn install --frozen-lockfile
+                          yarn tsc
+                          yarn build:all
+                          yarn test:all --silent
+
+                          echo "************* output files to upload to S3 for ERDS *************"
+                          # Check and list files/directories only if they exist
+                          # [ -d . ] && echo "Listing current directory:" && ls
+                          [ -d . ] && echo "Listing directories in the current directory:" && find . -maxdepth 1 -type d
+                          [ -d reports ] && echo "Listing 'reports' directory:" && ls reports || echo "'reports' directory does not exist."
+                          [ -d reports/tests ] && echo "Listing 'reports/tests' directory:" && ls reports/tests || echo "'reports/tests' directory does not exist."
+                          [ -d reports/coverage ] && echo "Listing 'reports/coverage' directory:" && ls reports/coverage || echo "'reports/coverage' directory does not exist."
+                          [ -d reports/coverage/lcov-report ] && echo "Listing 'reports/coverage/lcov-report' directory:" && ls reports/coverage/lcov-report || echo "'reports/coverage/lcov-report' directory does not exist."
+                          [ -d playwright-report ] && echo "Listing 'playwright-report' directory:" && ls playwright-report || echo "'playwright-report' directory does not exist."
+                          [ -d /addon/results ] && echo "Listing '/addon/results' directory:" && ls /addon/results || echo "'/addon/results' directory does not exist."
+                          [ -f /tmp/sonar.json ] && echo "Listing '/tmp/sonar.json' file:" && ls /tmp/sonar.json || echo "'/tmp/sonar.json' file does not exist."
+                          [ -f /tmp/results.json ] && echo "Listing '/tmp/results.json' file:" && ls /tmp/results.json || echo "'/tmp/results.json' file does not exist."
+
+                          # This does not work:
+                          # sh: 35: sonar-scanner: not found
+                          # sonar-scanner \
+                          #  -Dsonar.projectKey=uscis_backstage_v2 \
+                          #  -Dsonar.branch.name=<+codebase.branch> \
+                          #  -Dsonar.sources=. \
+                          #  -Dsonar.coverageReportPaths=reports/coverage/clover.xml
+                        envVariables:
+                          COREPACK_ENABLE_AUTO_PIN: "0"
+                        resources:
+                          limits:
+                            memory: 12Gi
+                            cpu: 8000m
+                      when:
+                        stageStatus: Success
+                  - step:
+                      type: Sonarqube
+                      name: Scan with SonarQube
+                      identifier: Scan_with_SonarQube
+                      spec:
+                        mode: orchestration
+                        config: default
+                        projectKey: uscis_backstage_v2
+                        branch: <+codebase.branch>
+                        target:
+                          type: repository
+                          detection: manual
+                          name: <+pipeline.properties.ci.codebase.repoName>
+                          variant: <+codebase.branch>
+                        advanced:
+                          log:
+                            level: info
+                          args:
+                            cli: |
+                              -Dsonar.branch.name=<+codebase.branch> 
+                        settings:
+                          verify_ssl: "false"
+                        resources:
+                          limits:
+                            memory: 8Gi
+                            cpu: 8000m
+                        connectorRef: account.acct_ecr_eid_connector_prod
+                        imageTag: 1.51.0
+                        auth:
+                          access_token: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#SONAR_TOKEN")>
+                          domain: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#SONAR_HOST_URL")>
+                          ssl: false
+                        tool:
+                          project_key: uscis_backstage_v2
+                  - step:
+                      type: S3Upload
+                      name: Upload Unit test results to ERDS
+                      identifier: Upload_Unit_test_results_to_ERDS
+                      spec:
+                        connectorRef: org.QISD_S3_Storage
+                        region: us-east-1
+                        bucket: harness-atd-storage
+                        sourcePath: reports/tests/index.html
+                        target: files/<+project.name>/<+pipeline.name>/<+pipeline.sequenceId>
+                  - step:
+                      type: S3Upload
+                      name: Upload Coverage results to ERDS
+                      identifier: Upload_Coverage_results_to_ERDS
+                      spec:
+                        connectorRef: org.QISD_S3_Storage
+                        region: us-east-1
+                        bucket: harness-atd-storage
+                        sourcePath: reports/coverage/lcov-report/index.html
+                        target: files/<+project.name>/<+pipeline.name>/<+pipeline.sequenceId>
+              caching:
+                enabled: true
+                paths:
+                  - ./packages/backend/dist/bundle.tar.gz
+                  - ./packages/backend/dist/skeleton.tar.gz
+                override: true
+                policy: push
+                key: backstage-qisd-cache/<+codebase.branch>/<+pipeline.sequenceId>
+              buildIntelligence:
+                enabled: false
+            variables:
+              - name: KAFKA_CLIENT_KEY_UPPER
+                type: String
+                description: ""
+                required: false
+                value: KAFKA_CLIENT_KEY_UPPER.pem
+              - name: KAFKA_CLIENT_KEY_LOWER
+                type: String
+                description: ""
+                required: false
+                value: KAFKA_CLIENT_KEY_LOWER.pem
+              - name: KAFKA_ENV_UPPER_NAME
+                type: String
+                description: ""
+                required: false
+                value: UPPER
+              - name: KAFKA_ENV_LOWER_NAME
+                type: String
+                description: ""
+                required: false
+                value: LOWER
+        - stage:
+            name: Nexus IQ Server
+            identifier: Nexus_IQ_Server
+            description: ""
+            type: SecurityTests
+            spec:
+              cloneCodebase: true
+              infrastructure:
+                useFromStage: Build
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Add USCIS certs
+                      identifier: Add_USCIS_certs
+                      spec:
+                        connectorRef: org.QISD_Nexus_NonProd
+                        image: nexus-nonprod-gss.uscis.dhs.gov:8121/qisd-node:20.18.0
+                        shell: Sh
+                        command: |-
+                          mkdir -p /shared/customer_artifacts/certificates/
+                          cp /etc/ssl/certs/ca-bundle.crt /shared/customer_artifacts/certificates/
+                  - step:
+                      type: Background
+                      name: Set up DinD
+                      identifier: Set_up_DinD
+                      spec:
+                        connectorRef: account.acct_dockerhub_proxy
+                        image: docker:dind
+                        shell: Sh
+                        privileged: true
+                        entrypoint:
+                          - dockerd
+                        resources:
+                          limits:
+                            memory: 2Gi
+                            cpu: 1000m
+                  - step:
+                      type: Security
+                      name: Scan with Nexus IQ Server
+                      identifier: Scan_with_Nexus_IQ_Server
+                      spec:
+                        privileged: true
+                        settings:
+                          policy_type: orchestratedScan
+                          scan_type: repository
+                          product_name: nexusiq
+                          product_config_name: default
+                          product_domain: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#IQ_SERVER_URL")>
+                          product_access_id: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#IQ_SERVER_USERNAME")>
+                          product_access_token: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#IQ_SERVER_PASSWORD")>
+                          product_organization_id: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#IQ_SERVER_ORG_ID")>
+                          product_project_name: <+pipeline.properties.ci.codebase.repoName>
+                          product_lookup_type: byPrivateId
+                          product_private_id: <+pipeline.properties.ci.codebase.repoName>
+                          target_name: <+pipeline.properties.ci.codebase.repoName>
+                          target_variant: <+codebase.branch>
+                          repository_branch: <+codebase.branch>
+                          repository_project: <+pipeline.properties.ci.codebase.repoName>
+                          verify_ssl: "false"
+                          bypass_ssl_check: "true"
+                          runner_registry_domain: nexus-nonprod-gss.uscis.dhs.gov:8132
+                          runner_registry_image_prefix: harness
+                          runner_tag: 1.4.0
+              sharedPaths:
+                - /var/run
+                - /shared/customer_artifacts/certificates/
+              caching:
+                enabled: true
+                paths:
+                  - package.json
+                override: true
+                policy: push
+                key: backstage-qisd-cache/<+codebase.branch>/<+pipeline.sequenceId>
+              buildIntelligence:
+                enabled: false
+        - stage:
+            name: Checkmarx
+            identifier: Checkmarx
+            description: ""
+            type: SecurityTests
+            spec:
+              cloneCodebase: true
+              infrastructure:
+                useFromStage: Build
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Scan with Checkmarx
+                      identifier: Scan_with_Checkmarx
+                      spec:
+                        connectorRef: org.QISD_Nexus_NonProd
+                        image: nexus-nonprod-gss.uscis.dhs.gov:8121/qisd-node:20.18.0
+                        shell: Sh
+                        command: |-
+                          curl https://nexus-gss.uscis.dhs.gov/nexus/repository/checkmarx/ast-cli/cx-latest -so ./cx
+                          chmod +x cx
+                          curl https://nexus-gss.uscis.dhs.gov/nexus/repository/checkmarx/sca-resolver/ScaResolver-latest -so ./sca-resolver
+                          chmod +x sca-resolver
+                          ./cx \
+                            scan create \
+                            --project-name Backstage \
+                            --branch <+codebase.branch> \
+                            --sca-resolver ./sca-resolver \
+                            --report-format sarif \
+                            --project-tags qisd \
+                            --scan-types sast,iac-security,sca,api-security \
+                            --file-filter !node_modules,!dist-types,!packages/app/dist/**,!packages/backend/dist/**,!docs,!reports,!test,!tests,!templates,!.scannerwork \
+                            --debug \
+                            -s . \
+                            --agent Harness \
+                            --base-uri <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#CX_URL")> \
+                            --tenant uscis \
+                            --client-id <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#CX_CLIENT_ID")> \
+                            --client-secret <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#CX_CLIENT_SECRET")>
+                  - step:
+                      type: Checkmarx
+                      name: Ingest results
+                      identifier: Ingest_results
+                      spec:
+                        mode: ingestion
+                        config: default
+                        target:
+                          type: repository
+                          name: <+pipeline.properties.ci.codebase.repoName>
+                          variant: <+codebase.branch>
+                        advanced:
+                          log:
+                            level: info
+                        settings:
+                          verify_ssl: "false"
+                        ingestion:
+                          file: cx_result.sarif
+              caching:
+                enabled: true
+                paths: []
+              buildIntelligence:
+                enabled: false
+            when:
+              pipelineStatus: Success
+              condition: "false"
+    - stage:
+        name: Prisma Cloud
+        identifier: Twistlock
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: true
+            override: true
+            paths:
+              - ./packages/backend/dist/bundle.tar.gz
+              - ./packages/backend/dist/skeleton.tar.gz
+            policy: pull
+            key: backstage-qisd-cache/<+codebase.branch>/<+pipeline.sequenceId>
+          infrastructure:
+            useFromStage: Build
+          buildIntelligence:
+            enabled: false
+          execution:
+            steps:
+              - step:
+                  type: Background
+                  name: Set up DinD
+                  identifier: Set_up_DinD
+                  spec:
+                    connectorRef: account.acct_dockerhub_proxy
+                    image: docker:dind
+                    shell: Sh
+                    privileged: true
+                    envVariables:
+                      https_proxy: http://pzen.apps.dhs.gov:10029
+                      HTTPS_PROXY: http://pzen.apps.dhs.gov:10029
+                      no_proxy: localhost,127.0.0.1,10.0.0.0/8,192.168.99.0/24,192.168.39.0/24,nexus-gss.uscis.dhs.gov,nexus-nonprod-gss.uscis.dhs.gov,git.uscis.dhs.gov,twistlock-nonprod.uscis.dhs.gov,twistlock.uscis.dhs.gov,.docker.internal,.uscis.dhs.gov,eks.amazonaws.com,s3.amazonaws.com,.s3.us-east-1.amazonaws.com,ecr.us-east-1.amazonaws.com,ec2.us-east-1.amazonaws.com
+                      NO_PROXY: localhost,127.0.0.1,10.0.0.0/8,192.168.99.0/24,192.168.39.0/24,nexus-gss.uscis.dhs.gov,nexus-nonprod-gss.uscis.dhs.gov,git.uscis.dhs.gov,twistlock-nonprod.uscis.dhs.gov,twistlock.uscis.dhs.gov,.docker.internal,.uscis.dhs.gov,eks.amazonaws.com,s3.amazonaws.com,.s3.us-east-1.amazonaws.com,ecr.us-east-1.amazonaws.com,ec2.us-east-1.amazonaws.com
+                      http_proxy: http://pzen.apps.dhs.gov:10029
+                      HTTP_PROXY: http://pzen.apps.dhs.gov:10029
+                    entrypoint:
+                      - dockerd
+                    resources:
+                      limits:
+                        memory: 4Gi
+                        cpu: 4000m
+              - step:
+                  type: Run
+                  name: Build container
+                  identifier: Build_container
+                  spec:
+                    connectorRef: account.acct_dockerhub_proxy
+                    image: docker:dind
+                    shell: Sh
+                    command: |-
+                      docker build \
+                          --pull \
+                          -t <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#NEXUS_NONPROD_URL")>/${IMAGE_NAME}:${IMAGE_BUILD_TAG} \
+                          -f ${DOCKERFILE_PATH} .
+                    privileged: true
+                    envVariables:
+                      DOCKER_BUILDKIT: "1"
+                      https_proxy: http://pzen.apps.dhs.gov:10029
+                      HTTPS_PROXY: http://pzen.apps.dhs.gov:10029
+                      no_proxy: localhost,127.0.0.1,10.0.0.0/8,192.168.99.0/24,192.168.39.0/24,nexus-gss.uscis.dhs.gov,nexus-nonprod-gss.uscis.dhs.gov,git.uscis.dhs.gov,twistlock-nonprod.uscis.dhs.gov,twistlock.uscis.dhs.gov,.docker.internal,.uscis.dhs.gov,eks.amazonaws.com,s3.amazonaws.com,.s3.us-east-1.amazonaws.com,ecr.us-east-1.amazonaws.com,ec2.us-east-1.amazonaws.com
+                      NO_PROXY: localhost,127.0.0.1,10.0.0.0/8,192.168.99.0/24,192.168.39.0/24,nexus-gss.uscis.dhs.gov,nexus-nonprod-gss.uscis.dhs.gov,git.uscis.dhs.gov,twistlock-nonprod.uscis.dhs.gov,twistlock.uscis.dhs.gov,.docker.internal,.uscis.dhs.gov,eks.amazonaws.com,s3.amazonaws.com,.s3.us-east-1.amazonaws.com,ecr.us-east-1.amazonaws.com,ec2.us-east-1.amazonaws.com
+                      http_proxy: http://pzen.apps.dhs.gov:10029
+                      HTTP_PROXY: http://pzen.apps.dhs.gov:10029
+                    resources:
+                      limits:
+                        memory: 12Gi
+                        cpu: 8000m
+              - step:
+                  type: PrismaCloud
+                  name: Scan with Prisma Cloud
+                  identifier: Scan_with_Prisma_Cloud
+                  spec:
+                    mode: orchestration
+                    config: default
+                    target:
+                      type: container
+                      name: <+pipeline.properties.ci.codebase.repoName>
+                      variant: <+codebase.branch>
+                    advanced:
+                      log:
+                        level: info
+                    settings:
+                      verify_ssl: "false"
+                      bypass_ssl_check: "true"
+                    resources:
+                      limits:
+                        memory: 8Gi
+                        cpu: 4000m
+                    privileged: true
+                    connectorRef: account.acct_ecr_eid_connector_prod
+                    imageTag: 2.39.0
+                    image:
+                      type: local_image
+                      tag: <+stage.variables.IMAGE_BUILD_TAG>
+                      name: <+stage.variables.IMAGE_NAME>
+                      domain: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#NEXUS_NONPROD_URL")>
+                    auth:
+                      access_token: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#PC_NONPROD_PASSWORD")>
+                      access_id: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#PC_NONPROD_USERNAME")>
+                      domain: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#PC_NONPROD_URL")>
+              - step:
+                  type: Run
+                  name: Push image to Nexus
+                  identifier: Push_image_to_Nexus
+                  spec:
+                    connectorRef: account.acct_dockerhub_proxy
+                    image: docker:dind
+                    shell: Sh
+                    command: |-
+                      docker login <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#NEXUS_NONPROD_URL")> \
+                        --username <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#NEXUS_USERNAME")> \
+                        --password <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#NEXUS_PASSWORD")>
+                      docker push <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#NEXUS_NONPROD_URL")>/${IMAGE_NAME}:${IMAGE_BUILD_TAG}
+
+                      echo "************* output files to upload to S3 for ERDS *************"
+                      # Check and list files/directories only if they exist
+                      # [ -d . ] && echo "Listing current directory:" && ls
+                      [ -d . ] && echo "Listing directories in the current directory:" && find . -maxdepth 1 -type d
+                      [ -d reports ] && echo "Listing 'reports' directory:" && ls reports || echo "'reports' directory does not exist."
+                      [ -d reports/tests ] && echo "Listing 'reports/tests' directory:" && ls reports/tests || echo "'reports/tests' directory does not exist."
+                      [ -d reports/coverage ] && echo "Listing 'reports/coverage' directory:" && ls reports/coverage || echo "'reports/coverage' directory does not exist."
+                      [ -d reports/coverage/lcov-report ] && echo "Listing 'reports/coverage/lcov-report' directory:" && ls reports/coverage/lcov-report || echo "'reports/coverage/lcov-report' directory does not exist."
+                      [ -d playwright-report ] && echo "Listing 'playwright-report' directory:" && ls playwright-report || echo "'playwright-report' directory does not exist."
+                      [ -d /addon/results ] && echo "Listing '/addon/results' directory:" && ls /addon/results || echo "'/addon/results' directory does not exist."
+                      [ -f /tmp/sonar.json ] && echo "Listing '/tmp/sonar.json' file:" && ls /tmp/sonar.json || echo "'/tmp/sonar.json' file does not exist."
+                      [ -f /tmp/results.json ] && echo "Listing '/tmp/results.json' file:" && ls /tmp/results.json || echo "'/tmp/results.json' file does not exist."
+                    privileged: true
+                    envVariables:
+                      DOCKER_BUILDKIT: "1"
+                      https_proxy: http://pzen.apps.dhs.gov:10029
+                      HTTPS_PROXY: http://pzen.apps.dhs.gov:10029
+                      no_proxy: localhost,127.0.0.1,10.0.0.0/8,192.168.99.0/24,192.168.39.0/24,nexus-gss.uscis.dhs.gov,nexus-nonprod-gss.uscis.dhs.gov,git.uscis.dhs.gov,twistlock-nonprod.uscis.dhs.gov,twistlock.uscis.dhs.gov,.docker.internal,.uscis.dhs.gov,eks.amazonaws.com,s3.amazonaws.com,.s3.us-east-1.amazonaws.com,ecr.us-east-1.amazonaws.com,ec2.us-east-1.amazonaws.com
+                      NO_PROXY: localhost,127.0.0.1,10.0.0.0/8,192.168.99.0/24,192.168.39.0/24,nexus-gss.uscis.dhs.gov,nexus-nonprod-gss.uscis.dhs.gov,git.uscis.dhs.gov,twistlock-nonprod.uscis.dhs.gov,twistlock.uscis.dhs.gov,.docker.internal,.uscis.dhs.gov,eks.amazonaws.com,s3.amazonaws.com,.s3.us-east-1.amazonaws.com,ecr.us-east-1.amazonaws.com,ec2.us-east-1.amazonaws.com
+                      http_proxy: http://pzen.apps.dhs.gov:10029
+                      HTTP_PROXY: http://pzen.apps.dhs.gov:10029
+                    resources:
+                      limits:
+                        memory: 1Gi
+                        cpu: 1000m
+              - step:
+                  type: Plugin
+                  name: Publish Artifacts
+                  identifier: Publish_Artifacts
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: plugins/artifact-metadata-publisher
+                    settings:
+                      file_urls: <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/qisd/common#NEXUS_NONPROD_URL")>/<+pipeline.properties.ci.codebase.repoName>:<+codebase.branch>
+                      artifact_file: artifact.txt
+          sharedPaths:
+            - /var/run
+            - /shared/customer_artifacts/certificates/
+        variables:
+          - name: IMAGE_NAME
+            type: String
+            description: ""
+            required: false
+            value: <+pipeline.properties.ci.codebase.repoName>
+          - name: IMAGE_BUILD_TAG
+            type: String
+            description: ""
+            required: false
+            value: <+codebase.branch>
+          - name: DOCKERFILE_PATH
+            type: String
+            description: ""
+            required: false
+            value: deployment/docker/Dockerfile.202408
+          - name: KAFKA_CLIENT_KEY_UPPER
+            type: String
+            description: ""
+            required: false
+            value: KAFKA_CLIENT_KEY_UPPER.pem
+          - name: KAFKA_CLIENT_KEY_LOWER
+            type: String
+            description: ""
+            required: false
+            value: KAFKA_CLIENT_KEY_LOWER.pem
+          - name: KAFKA_ENV_UPPER_NAME
+            type: String
+            description: ""
+            required: false
+            value: UPPER
+          - name: KAFKA_ENV_LOWER_NAME
+            type: String
+            description: ""
+            required: false
+            value: LOWER
+    - parallel:
+        - stage:
+            name: Deploy to Dev
+            identifier: Deploy_to_Dev
+            description: ""
+            type: Pipeline
+            spec:
+              org: ATD
+              pipeline: Deploy
+              project: Backstage
+              inputs:
+                identifier: Deploy
+                stages:
+                  - stage:
+                      identifier: Deploy
+                      type: Deployment
+                      spec:
+                        service:
+                          serviceInputs:
+                            serviceDefinition:
+                              type: NativeHelm
+                              spec:
+                                artifacts:
+                                  primary:
+                                    sources:
+                                      - identifier: Backstage
+                                        type: DockerRegistry
+                                        spec:
+                                          tag: <+codebase.branch>
+                        environment:
+                          environmentRef: dev
+                          gitBranch: main
+                          infrastructureDefinitions:
+                            - identifier: EKS_Backstage_Dev
+            tags: {}
+        - stage:
+            name: Deploy to Test
+            identifier: Deploy_to_Test
+            description: ""
+            type: Pipeline
+            spec:
+              org: ATD
+              pipeline: Deploy
+              project: Backstage
+              inputs:
+                identifier: Deploy
+                stages:
+                  - stage:
+                      identifier: Deploy
+                      type: Deployment
+                      spec:
+                        service:
+                          serviceInputs:
+                            serviceDefinition:
+                              type: NativeHelm
+                              spec:
+                                artifacts:
+                                  primary:
+                                    sources:
+                                      - identifier: Backstage
+                                        type: DockerRegistry
+                                        spec:
+                                          tag: <+codebase.branch>
+                        environment:
+                          environmentRef: test
+                          gitBranch: main
+                          infrastructureDefinitions:
+                            - identifier: EKS_Backstage_Test
+            tags: {}
+    - parallel:
+        - stage:
+            name: Performance Test
+            identifier: Performance_Test
+            description: ""
+            type: CI
+            spec:
+              cloneCodebase: true
+              infrastructure:
+                useFromStage: Build
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Fetch PT results from Jenkins
+                      identifier: Fetch_PT_results_from_Jenkins
+                      spec:
+                        connectorRef: org.QISD_Nexus_NonProd
+                        image: nexus-nonprod-gss.uscis.dhs.gov:8121/qisd-node:22
+                        shell: Sh
+                        command: |-
+                          apt-get -y install python3-pip
+                          python3 -m pip install requests
+                          python3 tests/get_performance_test_results.py ${PERFORMANCE_TEST_RESULT_URL} ${REPORT_FILE_NAME} <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/backstage/dev#JENKINS_MASTER_USERNAME")> <+secrets.getValue("org.hashicorpvault://QISD_CHE_Nonprod_Vault/backstage/dev#JENKINS_API_KEY")>
+                          # unzip ${REPORT_FILE_NAME}
+                          # ls pcRun
+
+                          echo "************* output files to upload to S3 for ERDS *************"
+                          # Check and list files/directories only if they exist
+                          # [ -d . ] && echo "Listing current directory:" && ls
+                          [ -d . ] && echo "Listing directories in the current directory:" && find . -maxdepth 1 -type d
+                          [ -d reports ] && echo "Listing 'reports' directory:" && ls reports || echo "'reports' directory does not exist."
+                          [ -d reports/tests ] && echo "Listing 'reports/tests' directory:" && ls reports/tests || echo "'reports/tests' directory does not exist."
+                          [ -d reports/coverage ] && echo "Listing 'reports/coverage' directory:" && ls reports/coverage || echo "'reports/coverage' directory does not exist."
+                          [ -d reports/coverage/lcov-report ] && echo "Listing 'reports/coverage/lcov-report' directory:" && ls reports/coverage/lcov-report || echo "'reports/coverage/lcov-report' directory does not exist."
+                          [ -d playwright-report ] && echo "Listing 'playwright-report' directory:" && ls playwright-report || echo "'playwright-report' directory does not exist."
+                          [ -d /addon/results ] && echo "Listing '/addon/results' directory:" && ls /addon/results || echo "'/addon/results' directory does not exist."
+                          [ -f /tmp/sonar.json ] && echo "Listing '/tmp/sonar.json' file:" && ls /tmp/sonar.json || echo "'/tmp/sonar.json' file does not exist."
+                          [ -f /tmp/results.json ] && echo "Listing '/tmp/results.json' file:" && ls /tmp/results.json || echo "'/tmp/results.json' file does not exist."
+                        envVariables:
+                          PERFORMANCE_TEST_RESULT_URL: https://jenkins-jmeter-gss.uscis.dhs.gov/view/LoadRunner/job/loadrunner_backstage_test_baseline/lastSuccessfulBuild/artifact/performanceTestsReports/pcRun/%2Azip%2A/pcRun
+                          REPORT_FILE_NAME: performance_reports.zip
+                  - step:
+                      type: S3Upload
+                      name: Upload Performance Tests to ERDS
+                      identifier: S3Upload_2
+                      spec:
+                        connectorRef: org.QISD_S3_Storage
+                        region: us-east-1
+                        bucket: harness-atd-storage
+                        sourcePath: performance_reports.zip
+                        target: files/<+project.name>/<+pipeline.name>/<+pipeline.sequenceId>
+              caching:
+                enabled: false
+                paths: []
+              buildIntelligence:
+                enabled: false
+        - stage:
+            name: Deploy to Demo
+            identifier: Deploy_to_Demo
+            description: ""
+            type: Pipeline
+            spec:
+              org: ATD
+              pipeline: Deploy
+              project: Backstage
+              inputs:
+                identifier: Deploy
+                stages:
+                  - stage:
+                      identifier: Deploy
+                      type: Deployment
+                      spec:
+                        service:
+                          serviceInputs:
+                            serviceDefinition:
+                              type: NativeHelm
+                              spec:
+                                artifacts:
+                                  primary:
+                                    sources:
+                                      - identifier: Backstage
+                                        type: DockerRegistry
+                                        spec:
+                                          tag: <+codebase.branch>
+                        environment:
+                          environmentRef: demo
+                          infrastructureDefinitions:
+                            - identifier: EKS_Backstage_Demo
+        - stage:
+            name: Integration Test
+            identifier: Integration_Test
+            description: ""
+            type: Pipeline
+            spec:
+              org: ATD
+              pipeline: Regression_Test
+              project: Backstage
+              inputs:
+                identifier: Regression_Test
+                parentSequenceId: <+pipeline.sequenceId> # Pass the sequenceId so child can stage files in S3 under that ID
+                properties:
+                  ci:
+                    codebase:
+                      build:
+                        spec:
+                          branch: main
+                        type: branch
+            tags: {}
