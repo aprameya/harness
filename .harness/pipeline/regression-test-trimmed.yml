@@ -1,0 +1,50 @@
+pipeline:
+  name: Regression Test
+  identifier: Regression_Test
+  orgIdentifier: ATD
+  projectIdentifier: Backstage
+  delegateSelectors:
+    - che-prod-tools-harness-atd-delegate
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: org.QISD_GHE
+        repoName: backstage-regression-tests
+        build: <+input>
+  stages:
+    - stage:
+        name: Regression Testing
+        identifier: Regression_Testing
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: account.acct_toolsprod_cluster_connector
+              namespace: harness-delegate-ng
+              serviceAccountName: harness-atd-delegate
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              harnessImageConnectorRef: account.acct_ecr_eid_connector_prod
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  type: S3Upload
+                  name: Upload Regression test results to ERDS
+                  identifier: Upload_Regression_test_results_to_ERDS
+                  spec:
+                    connectorRef: org.QISD_S3_Storage
+                    region: us-east-1
+                    bucket: harness-atd-storage
+                    sourcePath: playwright-report/index.html
+                    target: files/<+project.name>/<+pipeline.name>/<+input.parentSequenceId>
+  variables:
+    - name: parentSequenceId
+      type: String
+      description: Sequence ID of the parent pipeline
+      required: true # Set this to true to ensure it is passed
+      value: 'test'

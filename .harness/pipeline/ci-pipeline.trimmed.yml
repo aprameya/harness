@@ -1,0 +1,43 @@
+pipeline:
+  name: CI Pipeline
+  identifier: CI_Pipeline
+  orgIdentifier: ATD
+  projectIdentifier: Backstage
+  tags: {}
+  delegateSelectors:
+    - che-prod-tools-harness-atd-delegate
+  properties:
+    ci:
+      codebase:
+        connectorRef: org.QISD_GHE
+        repoName: backstage-qisd
+        build: <+input>
+  when:
+    condition: <+trigger.payload.pull_request.merged> == true
+  stages:
+    - parallel:
+        - stage:
+            name: Integration Test
+            identifier: Integration_Test
+            description: ""
+            type: Pipeline
+            spec:
+              org: ATD
+              pipeline: Regression_Test
+              project: Backstage
+              inputs:
+                identifier: Regression_Test
+                properties:
+                  ci:
+                    codebase:
+                      build:
+                        spec:
+                          branch: main
+                        type: branch
+            tags: {}
+            variables:
+              - name: parentSequenceId
+                type: String
+                description: ""
+                required: false
+                value: <+pipeline.sequenceId>

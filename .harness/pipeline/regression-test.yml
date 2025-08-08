@@ -1,0 +1,87 @@
+pipeline:
+  name: Regression Test
+  identifier: Regression_Test
+  orgIdentifier: ATD
+  projectIdentifier: Backstage
+  delegateSelectors:
+    - che-prod-tools-harness-atd-delegate
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: org.QISD_GHE
+        repoName: backstage-regression-tests
+        build: <+input>
+  variables:
+    - name: parentSequenceId
+      type: String
+      description: Sequence ID of the parent pipeline
+      required: true # Set this to true to ensure it is passed
+      value: 'not-passed'
+  stages:
+    - stage:
+        name: Regression Testing
+        identifier: Regression_Testing
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: account.acct_toolsprod_cluster_connector
+              namespace: harness-delegate-ng
+              serviceAccountName: harness-atd-delegate
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              harnessImageConnectorRef: account.acct_ecr_eid_connector_prod
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Run Tests
+                  identifier: Run_Tests
+                  spec:
+                    connectorRef: org.QISD_Nexus_NonProd
+                    image: nexus-nonprod-gss.uscis.dhs.gov:8121/qisd-node:22
+                    shell: Sh
+                    command: |-
+                      corepack install --global yarn@1
+                      yarn install --frozen-lockfile
+                      yarn playwright install --with-deps chromium
+                      yarn test
+
+                      echo "************* output files to upload to S3 for ERDS *************"
+                      # Check and list files/directories only if they exist
+                      # [ -d . ] && echo "Listing current directory:" && ls
+                      [ -d . ] && echo "Listing directories in the current directory:" && find . -maxdepth 1 -type d
+                      [ -d reports ] && echo "Listing 'reports' directory:" && ls reports || echo "'reports' directory does not exist."
+                      [ -d reports/tests ] && echo "Listing 'reports/tests' directory:" && ls reports/tests || echo "'reports/tests' directory does not exist."
+                      [ -d reports/coverage ] && echo "Listing 'reports/coverage' directory:" && ls reports/coverage || echo "'reports/coverage' directory does not exist."
+                      [ -d reports/coverage/lcov-report ] && echo "Listing 'reports/coverage/lcov-report' directory:" && ls reports/coverage/lcov-report || echo "'reports/coverage/lcov-report' directory does not exist."
+                      [ -d playwright-report ] && echo "Listing 'playwright-report' directory:" && ls playwright-report || echo "'playwright-report' directory does not exist."
+                      [ -d /addon/results ] && echo "Listing '/addon/results' directory:" && ls /addon/results || echo "'/addon/results' directory does not exist."
+                      [ -f /tmp/sonar.json ] && echo "Listing '/tmp/sonar.json' file:" && ls /tmp/sonar.json || echo "'/tmp/sonar.json' file does not exist."
+                      [ -f /tmp/results.json ] && echo "Listing '/tmp/results.json' file:" && ls /tmp/results.json || echo "'/tmp/results.json' file does not exist."
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths:
+                          - playwright-report/results.xml
+                    envVariables:
+                      BT_DESKTOP_MODE: "false"
+                    resources:
+                      limits:
+                        memory: 4Gi
+                        cpu: 4000m
+              - step:
+                  type: S3Upload
+                  name: Upload Regression test results to ERDS
+                  identifier: Upload_Regression_test_results_to_ERDS
+                  spec:
+                    connectorRef: org.QISD_S3_Storage
+                    region: us-east-1
+                    bucket: harness-atd-storage
+                    sourcePath: playwright-report/index.html
+                    target: files/<+project.name>/<+pipeline.name>/<+input.parentSequenceId>
